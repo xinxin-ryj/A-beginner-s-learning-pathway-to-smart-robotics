@@ -1,0 +1,510 @@
+import sensor, image, time,math
+from pyb import Pin,Timer,UART
+import kinematics,robotMoveCmd
+
+class ColorBlock():
+    sensor.reset() #初始化摄像头
+    sensor.set_pixformat(sensor.RGB565) #图像格式为 RGB565 灰度 GRAYSCALE
+    sensor.set_framesize(sensor.QQVGA) #QQVGA: 160x120
+    sensor.skip_frames(n=2000) #在更改设置后，跳过n张照片，等待感光元件变稳定
+    sensor.set_auto_gain(True) #使用颜色识别时需要关闭自动自动增益
+    sensor.set_auto_whitebal(True)#使用颜色识别时需要关闭自动自动白平衡
+
+    red_threshold=(0, 100, 20, 127, 0, 127)
+    blue_threshold=(0, 60, -128, 127, -128, -28)
+    green_threshold=(0, 100, -128, -28, 0, 70)
+    yellow_threshold=(50, 100, -30, 12, 20, 80)
+    track_color_threshold = red_threshold#追踪的颜色
+
+    uart = UART(3,115200)   #设置串口波特率，与stm32一致
+    uart.init(115200, bits=8, parity=None, stop=1 )
+
+    tim = Timer(4, freq=1000) # Frequency in Hz
+    led_dac = tim.channel(1, Timer.PWM, pin=Pin("P7"), pulse_width_percent=50)
+    led_dac.pulse_width_percent(100)
+
+    cap_color_status=0#抓取物块颜色标志，用来判断物块抓取
+    #机械臂移动位置
+    move_x=0
+    move_y=100
+
+    mid_block_cx=80.5
+    mid_block_cy=60.5
+
+    mid_block_cnt=0#用来记录机械臂已对准物块计数，防止误差
+
+    move_status=0#机械臂移动的方式
+
+    stack_datum_mark=0#寻找码垛得基准点
+    datum_mark_cx=0
+    datum_mark_cy=0
+
+    block_cnt=0#记录码垛物块数量
+
+    servo0=1500
+    servo1=1500
+    servo2=1500
+    servo3=860
+
+    servo_option=1#选择操作的舵机
+
+    #机器人运动
+    robot_move_cmd = robotMoveCmd.RobotMoveCmd()
+    kinematic = kinematics.Kinematics()
+
+    def init(self,cx=80.5,cy=60.5):#初始化巡线配置，传入两个参数调整中位值
+        sensor.reset() #初始化摄像头
+        sensor.set_pixformat(sensor.RGB565) #图像格式为 RGB565 灰度 GRAYSCALE
+        sensor.set_framesize(sensor.QQVGA) #QQVGA: 160x120
+        sensor.skip_frames(n=2000) #在更改设置后，跳过n张照片，等待感光元件变稳定
+        sensor.set_auto_gain(True) #使用颜色识别时需要关闭自动自动增益
+        sensor.set_auto_whitebal(True)#使用颜色识别时需要关闭自动自动白平衡
+
+        self.uart.init(115200, bits=8, parity=None, stop=1 )
+        self.led_dac.pulse_width_percent(100)
+
+        self.cap_color_status=0#抓取物块颜色标志，用来判断物块抓取
+        #机械臂移动位置
+        self.move_x=0
+        self.move_y=100
+
+        self.mid_block_cx=cx
+        self.mid_block_cy=cy
+
+        self.mid_block_cnt=0#用来记录机械臂已对准物块计数，防止误差
+
+        self.move_status=0#机械臂移动的方式
+
+
+        self.stack_datum_mark=0#寻找码垛得基准点
+        self.datum_mark_cx=0
+        self.datum_mark_cy=0
+
+        self.block_cnt=0#记录码垛物块数量
+
+        self.servo0=1500
+        self.servo1=1500
+        self.servo2=1500
+        self.servo3=860
+        self.servo_option=1#选择操作的舵机
+
+        self.kinematic.kinematics_move(self.move_x,self.move_y,70,1000)
+        time.sleep_ms(1000)
+
+    def run_sort(self):#分拣
+        #物块中心点
+        block_cx=self.mid_block_cx
+        block_cy=self.mid_block_cy
+        color_read_succed=0#是否识别到颜色
+        color_status=0
+        # 获取图像
+        img = sensor.snapshot()
+        red_blobs = img.find_blobs([self.red_threshold],x_stride=15, y_stride=15, pixels_threshold=25 )
+        blue_blobs = img.find_blobs([self.blue_threshold], x_stride=15, y_stride=15, pixels_threshold=25 )
+        green_blobs = img.find_blobs([self.green_threshold], x_stride=15, y_stride=15, pixels_threshold=50 )
+        #***************首先进行色块检测********************
+        if red_blobs and (self.cap_color_status==0 or self.cap_color_status=='R'):#红色
+            color_status = 'R'
+            color_read_succed=1
+            for y in red_blobs:
+                img.draw_rectangle((y[0],y[1],y[2],y[3]),color=(255,255,255))
+                img.draw_cross(y[5], y[6],size=2,color=(255,0,0))
+                img.draw_string(y[0], (y[1]-10), "red", color=(255,0,0))
+                #print("中心X坐标",y[5],"中心Y坐标",y[6],"识别颜色类型","红色")
+                block_cx=y[5]
+                block_cy=y[6]
+
+        elif blue_blobs and (self.cap_color_status==0 or self.cap_color_status=='B'):#蓝色
+            color_status = 'B'
+            color_read_succed=1
+            for y in blue_blobs:
+                img.draw_rectangle((y[0],y[1],y[2],y[3]),color=(255,255,255))
+                img.draw_cross(y[5], y[6],size=2,color=(0,0,255))
+                img.draw_string(y[0], (y[1]-10), "blue", color=(0,0,255))
+                #print("中心X坐标",y[5],"中心Y坐标",y[6],"识别颜色类型","蓝色")
+                block_cx=y[5]
+                block_cy=y[6]
+
+        elif green_blobs and (self.cap_color_status==0 or self.cap_color_status=='G'):#绿色
+            color_status = 'G'
+            color_read_succed=1
+            for y in green_blobs:
+                img.draw_rectangle((y[0],y[1],y[2],y[3]),color=(255,255,255))
+                img.draw_cross(y[5], y[6],size=2,color=(0,255,0))
+                img.draw_string(y[0], (y[1]-10), "green", color=(0,255,0))
+                #print("中心X坐标",y[5],"中心Y坐标",y[6],"识别颜色类型","绿色")
+                block_cx=y[5]
+                block_cy=y[6]
+
+        #************************************************ 运动机械臂*************************************************************************************
+        if color_read_succed==1 or (self.move_status==1):#识别到颜色或者到路口
+
+            if self.move_status==0:#第0阶段：机械臂寻找物块位置
+                if(abs(block_cx-self.mid_block_cx)>2):
+                    if block_cx > self.mid_block_cx:
+                        self.move_x+=0.2
+                    else:
+                        self.move_x-=0.2
+                if(abs(block_cy-self.mid_block_cy)>2):
+                    if block_cy > self.mid_block_cy and self.move_y>80:
+                        self.move_y-=0.3
+                    else:
+                        self.move_y+=0.3
+                if abs(block_cy-self.mid_block_cy)<=2 and abs(block_cx-self.mid_block_cx)<=2: #寻找到物块，机械臂进入第二阶段
+                    self.mid_block_cnt += 1
+                    if self.mid_block_cnt > 10:#计数100次对准物块，防止误差
+                        self.mid_block_cnt=0
+                        self.move_status=1
+                        self.cap_color_status=color_status
+                else:
+                    self.mid_block_cnt=0
+                    self.kinematic.kinematics_move(self.move_x,self.move_y,70,10)
+                time.sleep_ms(10)
+
+            elif self.move_status==1:#第1阶段：机械臂抓取物块
+                self.move_status=2
+                #判断矩形倾角，改变机械爪
+                for r in img.find_rects():
+                    if r.corners()[0][0]<block_cx and r.corners()[0][1]>block_cy and r.corners()[2][0]>block_cx and r.corners()[2][1]<block_cy:#判断矩形是否为物块
+                        p0=r.corners()[0]
+                        p1=r.corners()[1]
+                        p2=r.corners()[2]
+                        p3=r.corners()[3]
+                        spin_calw=1500
+                        if abs(p2[1]-p3[1])>2:#计算物块对齐角度
+                            spin_calw += (p2[1]-p3[1])*15
+                        elif  abs(p3[0]-p0[0])>2:
+                            spin_calw += (p3[0]-p0[0])*15
+                        if spin_calw>=2500 and spin_calw<=500:
+                            spin_calw=1500
+                        self.kinematic.send_str("{{#004P{:0^4}T1000!}}".format(spin_calw))#旋转和张开机械爪
+                l=math.sqrt(self.move_x*self.move_x+self.move_y*self.move_y)
+                sin=self.move_y/l
+                cos=self.move_x/l
+                self.move_x=(l+85)*cos
+                self.move_y=(l+85)*sin
+                time.sleep_ms(100)
+                self.kinematic.kinematics_move(self.move_x,self.move_y,70,1000)#移动机械臂到物块上方
+                time.sleep_ms(100)
+                self.kinematic.send_str("{#005P1000T1000!}")
+                time.sleep_ms(1000)
+                self.kinematic.kinematics_move(self.move_x,self.move_y,25,1000)#移动机械臂下移到物块
+                time.sleep_ms(1200)
+                self.kinematic.send_str("{#005P1700T1000!}")#机械爪抓取物块
+                time.sleep_ms(1200)
+                self.kinematic.send_str("{#004P1500T1000!}")#旋转和张开机械爪
+                self.kinematic.kinematics_move(self.move_x,self.move_y,120,1000)#移动机械臂抬起
+                time.sleep_ms(1200)
+                #机械臂旋转到要方向物块的指定位置
+                self.move_x=100
+                self.move_y=60
+                self.kinematic.kinematics_move(self.move_x,self.move_y,120,1000)
+                time.sleep_ms(1200)
+                self.kinematic.kinematics_move(self.move_x,self.move_y,70,1000)
+                time.sleep_ms(1200)
+                self.mid_block_cnt=0
+
+            elif self.move_status==2:#第2阶段：机械臂寻找放下物块的框框
+                if(abs(block_cx-self.mid_block_cx)>3):
+                    if block_cx > self.mid_block_cx and self.move_y>1:
+                        self.move_y-=0.3
+                    else:
+                        self.move_y+=0.3
+                if(abs(block_cy-self.mid_block_cy)>3):
+                    if block_cy > self.mid_block_cy:
+                        self.move_x-=0.2
+                    else:
+                        self.move_x+=0.2
+                if abs(block_cy-self.mid_block_cy)<=3 and abs(block_cx-self.mid_block_cx)<=3: #寻找到物块，机械臂进入第二阶段
+                    self.mid_block_cnt += 1
+                    if self.mid_block_cnt>5:#计数5次对准物块，防止误差
+                        self.mid_block_cnt=0
+                        self.move_status=3
+                        self.cap_color_status=color_status
+                else:
+                    self.mid_block_cnt=0
+                    self.kinematic.kinematics_move(self.move_x,self.move_y,70,10)
+                time.sleep_ms(10)
+
+            elif self.move_status==3:#第3阶段：机械臂放下物块并归位
+                self.move_status=0
+                l=math.sqrt(self.move_x*self.move_x+self.move_y*self.move_y)
+                sin=self.move_y/l
+                cos=self.move_x/l
+                self.move_x=(l+85)*cos
+                self.move_y=(l+85)*sin
+                time.sleep_ms(100)
+                self.kinematic.kinematics_move(self.move_x,self.move_y,70,1000)#移动机械臂到物块上方
+                time.sleep_ms(1000)
+                self.kinematic.kinematics_move(self.move_x,self.move_y,25,1000)#移动机械臂下移到物块
+                time.sleep_ms(1200)
+                self.kinematic.send_str("{#005P1000T1000!}")#机械爪放下物块
+                time.sleep_ms(1200)
+                self.kinematic.kinematics_move(self.move_x,self.move_y,70,1000)#移动机械臂抬起
+                time.sleep_ms(1200)
+                self.move_x=0#机械臂归位
+                self.move_y=100
+                self.kinematic.kinematics_move(self.move_x,self.move_y,70,1000)
+                time.sleep_ms(1200)
+                self.mid_block_cnt=0
+                self.cap_color_status=0
+
+
+    def run_stack(self):#码垛
+        #物块中心点
+        block_cx=self.mid_block_cx
+        block_cy=self.mid_block_cy
+        color_read_succed=0#是否识别到颜色
+        # 获取图像
+        img = sensor.snapshot()
+        #***************首先进行色块检测********************
+        if self.move_status==2:
+            #寻找码垛堆放基准点
+            yellow_blobs = img.find_blobs([self.yellow_threshold], x_stride=15, y_stride=15, pixels_threshold=25 )
+            if yellow_blobs:#红色
+                color_status = 'R'
+                color_read_succed=1
+                for y in yellow_blobs:
+                    img.draw_rectangle((y[0],y[1],y[2],y[3]),color=(255,255,255))
+                    img.draw_cross(y[5], y[6],size=2,color=(255,0,0))
+                    img.draw_string(y[0], (y[1]-10), "yellow", color=(255,0,0))
+                    #print("中心X坐标",y[5],"中心Y坐标",y[6],"识别颜色类型","红色")
+                    block_cx=y[5]
+                    block_cy=y[6]
+        else:
+            red_blobs = img.find_blobs([self.red_threshold],x_stride=15, y_stride=15, pixels_threshold=25 )
+            blue_blobs = img.find_blobs([self.blue_threshold], x_stride=15, y_stride=15, pixels_threshold=25 )
+            green_blobs = img.find_blobs([self.green_threshold], x_stride=15, y_stride=15, pixels_threshold=25 )
+            if red_blobs:#红色
+                color_read_succed=1
+                for y in red_blobs:
+                    img.draw_rectangle((y[0],y[1],y[2],y[3]),color=(255,255,255))
+                    img.draw_cross(y[5], y[6],size=2,color=(255,0,0))
+                    img.draw_string(y[0], (y[1]-10), "red", color=(255,0,0))
+                    #print("中心X坐标",y[5],"中心Y坐标",y[6],"识别颜色类型","红色")
+                    block_cx=y[5]
+                    block_cy=y[6]
+
+            elif blue_blobs:#蓝色
+                color_read_succed=1
+                for y in blue_blobs:
+                    img.draw_rectangle((y[0],y[1],y[2],y[3]),color=(255,255,255))
+                    img.draw_cross(y[5], y[6],size=2,color=(0,0,255))
+                    img.draw_string(y[0], (y[1]-10), "blue", color=(0,0,255))
+                    #print("中心X坐标",y[5],"中心Y坐标",y[6],"识别颜色类型","蓝色")
+                    block_cx=y[5]
+                    block_cy=y[6]
+
+            elif green_blobs:#绿色
+                color_read_succed=1
+                for y in green_blobs:
+                    img.draw_rectangle((y[0],y[1],y[2],y[3]),color=(255,255,255))
+                    img.draw_cross(y[5], y[6],size=2,color=(0,255,0))
+                    img.draw_string(y[0], (y[1]-10), "green", color=(0,255,0))
+                    #print("中心X坐标",y[5],"中心Y坐标",y[6],"识别颜色类型","绿色")
+                    block_cx=y[5]
+                    block_cy=y[6]
+
+        #************************************************ 运动机械臂*************************************************************************************
+        if color_read_succed==1 or (self.move_status==1 or self.move_status==3):#识别到颜色或者到路口
+
+            if self.move_status==0:#第0阶段：机械臂寻找物块位置
+                if(abs(block_cx-self.mid_block_cx)>2):
+                    if block_cx > self.mid_block_cx:
+                        self.move_x+=0.2
+                    else:
+                        self.move_x-=0.2
+                if(abs(block_cy-self.mid_block_cy)>2):
+                    if block_cy > self.mid_block_cy and self.move_y>80:
+                        self.move_y-=0.3
+                    else:
+                        self.move_y+=0.3
+                if abs(block_cy-self.mid_block_cy)<=2 and abs(block_cx-self.mid_block_cx)<=2: #寻找到物块，机械臂进入第二阶段
+                    self.mid_block_cnt += 1
+                    if self.mid_block_cnt > 10:#计数50次对准物块，防止误差
+                        self.mid_block_cnt=0
+                        self.move_status=1
+                else:
+                    self.mid_block_cnt=0
+                    self.kinematic.kinematics_move(self.move_x,self.move_y,70,10)
+                time.sleep_ms(10)
+
+            elif self.move_status==1:#第1阶段：机械臂抓取物块
+                self.move_status=2
+                #判断矩形倾角，改变机械爪
+                for r in img.find_rects():
+                    if r.corners()[0][0]<block_cx and r.corners()[0][1]>block_cy and r.corners()[2][0]>block_cx and r.corners()[2][1]<block_cy:#判断矩形是否为物块
+                        p0=r.corners()[0]
+                        p1=r.corners()[1]
+                        p2=r.corners()[2]
+                        p3=r.corners()[3]
+                        spin_calw=1500
+                        if abs(p2[1]-p3[1])>2:#计算物块对齐角度
+                            spin_calw += (p2[1]-p3[1])*15
+                        elif  abs(p3[0]-p0[0])>2:
+                            spin_calw += (p3[0]-p0[0])*15
+                        if spin_calw>=2500 and spin_calw<=500:
+                            spin_calw=1500
+                        self.kinematic.send_str("{{#004P{:0^4}T1000!}}".format(spin_calw))#旋转和张开机械爪
+                l=math.sqrt(self.move_x*self.move_x+self.move_y*self.move_y)
+                sin=self.move_y/l
+                cos=self.move_x/l
+                self.move_x=(l+85)*cos
+                self.move_y=(l+85)*sin
+                time.sleep_ms(100)
+                self.kinematic.kinematics_move(self.move_x,self.move_y,70,1000)#移动机械臂到物块上方
+                time.sleep_ms(100)
+                self.kinematic.send_str("{#005P1000T1000!}")
+                time.sleep_ms(1000)
+                self.kinematic.kinematics_move(self.move_x,self.move_y,25,1000)#移动机械臂下移到物块
+                time.sleep_ms(1200)
+                self.kinematic.send_str("{#005P1700T1000!}")#机械爪抓取物块
+                time.sleep_ms(1200)
+                self.kinematic.send_str("{#004P1500T1000!}")#旋转和张开机械爪
+                self.kinematic.kinematics_move(self.move_x,self.move_y,120,1000)#移动机械臂抬起
+                time.sleep_ms(1200)
+                #机械臂旋转到要方向物块的指定位置
+                self.move_x=80
+                self.move_y=60
+                self.kinematic.kinematics_move(self.move_x,self.move_y,120,1000)
+                time.sleep_ms(1200)
+                self.mid_block_cnt=0
+                if self.stack_datum_mark==1:#基准点已找到，跳过下个阶段
+                    self.move_status=3
+                    return
+                self.kinematic.kinematics_move(self.move_x,self.move_y,70,1000)
+                time.sleep_ms(1200)
+
+            elif self.move_status==2:#第2阶段：机械臂寻找放下物块的框框
+                if(abs(block_cx-self.mid_block_cx)>5):
+                    if block_cx > self.mid_block_cx :
+                        self.move_y-=0.3
+                    else:
+                        self.move_y+=0.3
+                if(abs(block_cy-self.mid_block_cy-30)>5):
+                    if block_cy-30 > self.mid_block_cy:
+                        self.move_x-=0.2
+                    else:
+                        self.move_x+=0.2
+                if abs(block_cy-self.mid_block_cy-30)<=5 and abs(block_cx-self.mid_block_cx)<=5: #寻找到物块，机械臂进入第二阶段
+                    self.mid_block_cnt += 1
+                    if self.mid_block_cnt>5:#计数5次对准物块，防止误差
+                        self.mid_block_cnt=0
+                        self.move_status=3
+                        #标记基准点
+                        l=math.sqrt(self.move_x*self.move_x+self.move_y*self.move_y)
+                        sin=self.move_y/l
+                        cos=self.move_x/l
+                        self.move_x=(l+65)*cos
+                        self.move_y=(l+65)*sin
+                        self.stack_datum_mark=1
+                        self.datum_mark_cx=self.move_x
+                        self.datum_mark_cy=self.move_y
+                else:
+                    self.mid_block_cnt=0
+                    self.kinematic.kinematics_move(self.move_x,self.move_y,70,10)
+                time.sleep_ms(10)
+
+            elif self.move_status==3:#第3阶段：机械臂放下物块并归位
+                self.move_status=0
+                time.sleep_ms(100)
+                if self.block_cnt==0:
+                    self.block_cnt=1
+                    self.kinematic.kinematics_move(self.move_x,self.move_y,20,1000)#移动机械臂到物块上方
+                elif self.block_cnt==1:
+                    self.block_cnt=2
+                    #标记基准点
+                    l=math.sqrt(self.datum_mark_cx*self.datum_mark_cx+self.datum_mark_cy*self.datum_mark_cy)
+                    sin=self.datum_mark_cy/l
+                    cos=self.datum_mark_cx/l
+                    self.move_x=(l-10)*cos
+                    self.move_y=(l-10)*sin
+                    self.kinematic.kinematics_move(self.move_x,self.move_y,50,1000)#移动机械臂到物块上方
+                elif self.block_cnt==2:
+                    self.block_cnt=3
+                    #标记基准点
+                    l=math.sqrt(self.datum_mark_cx*self.datum_mark_cx+self.datum_mark_cy*self.datum_mark_cy)
+                    sin=self.datum_mark_cy/l
+                    cos=self.datum_mark_cx/l
+                    self.move_x=(l-20)*cos
+                    self.move_y=(l-20)*sin
+                    self.kinematic.kinematics_move(self.move_x,self.move_y,90,1000)#移动机械臂到物块上方
+                else:
+                    return
+                time.sleep_ms(1200)
+                self.kinematic.send_str("{#005P1000T1000!}")#机械爪放下物块
+                time.sleep_ms(1200)
+                self.kinematic.kinematics_move(self.move_x,self.move_y,100,1000)#移动机械臂抬起
+                time.sleep_ms(1200)
+                self.move_x=0#机械臂归位
+                self.move_y=100
+                self.kinematic.kinematics_move(self.move_x,self.move_y,70,1000)
+                time.sleep_ms(1200)
+                self.mid_block_cnt=0
+                self.cap_color_status=0
+
+    def run_track(self):#追踪
+        #物块中心点
+        block_cx=self.mid_block_cx
+        block_cy=self.mid_block_cy
+        # 获取图像
+        img = sensor.snapshot()
+        blobs = img.find_blobs([self.track_color_threshold],x_stride=15, y_stride=15, pixels_threshold=25 )
+        #***************首先进行色块检测********************
+        if blobs:#红色
+            max_size = 0
+            max_blob=blobs[0]
+        for blob in blobs:#寻找最大
+            if blob[2] * blob[3] > max_size:
+                max_blob = blob
+                max_size = blob[2] * blob[3]
+                img.draw_rectangle((max_blob[0],max_blob[1],max_blob[2],max_blob[3]),color=(255,255,255))
+                img.draw_cross(max_blob[5], max_blob[6],size=2,color=(255,0,0))
+                img.draw_string(max_blob[0], (max_blob[1]-10), "color", color=(255,0,0))
+                #print("中心X坐标",max_blob[5],"中心Y坐标",max_blob[6],"识别颜色类型","红色")
+                block_cx=max_blob[5]
+                block_cy=max_blob[6]
+
+        #************************运动机械臂**********************************
+        if(abs(block_cx-self.mid_block_cx)>=5):
+            if block_cx > self.mid_block_cx:
+                self.move_x=-0.5*abs(block_cx-self.mid_block_cx)
+            else:
+                self.move_x=0.5*abs(block_cx-self.mid_block_cx)
+
+        if(abs(block_cy-self.mid_block_cy)>=3):
+            if block_cy > self.mid_block_cy:
+                self.move_y=-0.4*abs(block_cy-self.mid_block_cy)
+            else:
+                self.move_y=0.4*abs(block_cy-self.mid_block_cy)
+
+            if self.servo_option==1:
+                self.servo_option=2
+                self.servo1=int(self.servo1+self.move_y*0.5)
+            elif self.servo_option==2:
+                self.servo_option=3
+                self.servo2=int(self.servo2-self.move_y*0.6)
+            elif self.servo_option==3:
+                self.servo_option=1
+                self.servo0=int(self.servo0+self.move_x)
+
+
+        if self.servo0>2400: self.servo0=2400
+        elif self.servo0<650: self.servo0=650
+        if self.servo1>2400: self.servo1=2400
+        elif self.servo1<500: self.servo1=500
+        if self.servo2>2400: self.servo2=2400
+        elif self.servo2<500: self.servo2=500
+
+        self.kinematic.send_str("{{#000P{:0>4d}T0000!#001P{:0>4d}T0000!#002P{:0>4d}T00020!#003P{:0>4d}T0000!}}".format(self.servo0,self.servo1,self.servo2,self.servo3))
+        time.sleep_ms(10)
+
+
+
+
+
+
+
+
+
+
